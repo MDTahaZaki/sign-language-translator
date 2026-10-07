@@ -6,7 +6,7 @@ import {KNNImageClassifier} from 'deeplearn-knn-image-classifier';
 import * as dl from 'deeplearn';
 
 
-// Webcam Image size. Must be 227. 
+// Webcam Image size. Must be 227.
 const IMAGE_SIZE = 227;
 // K value for KNN
 const TOPK = 10;
@@ -58,16 +58,16 @@ class Main {
     this.then = Date.now()
     this.startTime = this.then;
     this.fps = 5; //framerate - number of prediction per second
-    this.fpsInterval = 1000/(this.fps); 
+    this.fpsInterval = 1000/(this.fps);
     this.elapsed = 0;
 
     this.trainingListDiv = document.getElementById("training-list")
     this.exampleListDiv = document.getElementById("example-list")
-    
+
     this.knn = null
 
     this.textLine = document.getElementById("text")
-    
+
     // Get video element that will contain the webcam image
     this.video = document.getElementById('video');
 
@@ -77,8 +77,11 @@ class Main {
 
     this.video.addEventListener('mousedown', () => {
       // click on video to go back to training buttons
-      main.pausePredicting();
+      if(!this.knn) return
+      this.pausePredicting();
       this.trainingListDiv.style.display = "block"
+      this.textLine.innerText = "Step 2: Train"
+      this.startTraining()
     })
 
     // add word to training example set
@@ -93,7 +96,7 @@ class Main {
         this.createButtonList(false)
         this.updateExampleCount()
         //console.log(words)
-        
+
 
         if(checkbox.checked){
           endWords.push(word)
@@ -120,9 +123,9 @@ class Main {
     document.getElementById("status").style.display = "none"
 
     this.createTrainingBtn()
-    
+
     this.createButtonList(false)
-    
+
     // load text to speech
     this.tts = new TextToSpeech()
 
@@ -212,7 +215,7 @@ class Main {
 
       For OTHER, capture yourself in an idle state to act as a catchall sign. e.g hands down by your side`
       this.addWordForm.appendChild(p)
-      
+
       this.loadKNN()
 
       this.createPredictBtn()
@@ -220,7 +223,7 @@ class Main {
       this.textLine.innerText = "Step 2: Train"
 
       let subtext = document.createElement('span')
-      subtext.innerHTML = "<br/>Time to associate signs with the words" 
+      subtext.innerHTML = "<br/>Time to associate signs with the words"
       subtext.classList.add('subtext')
       this.textLine.appendChild(subtext)
 
@@ -251,7 +254,11 @@ class Main {
       this.video.height = IMAGE_SIZE;
 
       this.video.addEventListener('playing', ()=> this.videoPlaying = true);
-      this.video.addEventListener('paused', ()=> this.videoPlaying = false);
+      this.video.addEventListener('pause', ()=> this.videoPlaying = false);
+    })
+    .catch((err) => {
+      console.log(err)
+      alert("Could not access the webcam.\n\nPlease allow camera access and make sure no other app is using it, then reload the page.\n\n" + err.name)
     })
   }
 
@@ -260,8 +267,17 @@ class Main {
     this.knn = new KNNImageClassifier(words.length, TOPK);
 
     // Load knn model
+    this.setStatusText("Status: Loading model...")
     this.knn.load()
-    .then(() => this.startTraining()); 
+    .then(() => {
+      this.setStatusText("Status: Model loaded - Training")
+      this.startTraining()
+    })
+    .catch((err) => {
+      console.log(err)
+      this.setStatusText("Status: Model failed to load")
+      alert("Failed to load the model. Check your internet connection and reload the page.")
+    })
   }
 
   updateExampleCount(){
@@ -274,8 +290,9 @@ class Main {
 
     // Clear List
     this.exampleListDiv.innerHTML = ""
+    this.infoTexts = []
 
-    // Create training buttons and info texts    
+    // Create training buttons and info texts
     for(let i=0;i<words.length; i++){
       this.createButton(i, showBtn)
     }
@@ -285,7 +302,7 @@ class Main {
     const div = document.createElement('div');
     this.exampleListDiv.appendChild(div);
     div.style.marginBottom = '10px';
-    
+
     // Create Word Text
     const wordText = document.createElement('span')
 
@@ -297,8 +314,8 @@ class Main {
       wordText.innerText = words[i].toUpperCase()+" "
       wordText.style.fontWeight = "bold"
     }
-    
-    
+
+
     div.appendChild(wordText);
 
     if(showBtn){
@@ -308,8 +325,14 @@ class Main {
       div.appendChild(button);
 
       // Listen for mouse events when clicking the button
-      button.addEventListener('mousedown', () => this.training = i);
-      button.addEventListener('mouseup', () => this.training = -1);
+      const startAdding = (e) => { e.preventDefault(); this.training = i }
+      const stopAdding = () => this.training = -1
+      button.addEventListener('mousedown', startAdding);
+      button.addEventListener('touchstart', startAdding);
+      button.addEventListener('mouseup', stopAdding);
+      button.addEventListener('mouseleave', stopAdding);
+      button.addEventListener('touchend', stopAdding);
+      button.addEventListener('touchcancel', stopAdding);
 
       // Create clear button to emove training examples
       const btn = document.createElement('button')
@@ -318,10 +341,10 @@ class Main {
 
       btn.addEventListener('mousedown', () => {
         console.log("clear training data for this label")
-        this.knn.clearClass(i)
+        if(this.knn) this.knn.clearClass(i)
         this.infoTexts[i].innerText = " 0 examples"
       })
-      
+
       // Create info text
       const infoText = document.createElement('span')
       infoText.innerText = " 0 examples";
@@ -329,7 +352,7 @@ class Main {
       this.infoTexts.push(infoText);
     }
   }
-  
+
   startTraining(){
     if (this.timer) {
       this.stopTraining();
@@ -345,22 +368,23 @@ class Main {
     }
     this.timer = requestAnimationFrame(this.train.bind(this));
   }
-  
+
   stopTraining(){
     this.video.pause();
     cancelAnimationFrame(this.timer);
   }
-  
+
   train(){
-    if(this.videoPlaying){
+    if(this.videoPlaying && this.video.readyState >= 2){
       // Get image data from video element
       const image = dl.fromPixels(this.video);
-      
+
       // Train class if one of the buttons is held down
       if(this.training != -1){
         // Add current image to classifier
         this.knn.addImage(image, this.training)
       }
+      image.dispose()
 
       const exampleCount = this.knn.getClassExampleCount()
 
@@ -380,6 +404,8 @@ class Main {
     if(this.timer){
       this.stopTraining();
     }
+
+    cancelAnimationFrame(this.pred)
 
     document.getElementById("status").style.background = "deepskyblue"
     this.setStatusText("Status: Ready!")
@@ -403,7 +429,7 @@ class Main {
 
       this.then = this.now - (this.elapsed % this.fpsInterval)
 
-      if(this.videoPlaying){
+      if(this.videoPlaying && this.video.readyState >= 2){
         const exampleCount = this.knn.getClassExampleCount();
 
         const image = dl.fromPixels(this.video);
@@ -415,8 +441,8 @@ class Main {
 
               // if matches & is above threshold & isnt same as prev prediction
               // and is not the last class which is a catch all class
-              if(res.classIndex == i 
-                && res.confidences[i] > predictionThreshold 
+              if(res.classIndex == i
+                && res.confidences[i] > predictionThreshold
                 && res.classIndex != this.previousPrediction
                 && res.classIndex != words.length-1){
 
@@ -428,7 +454,13 @@ class Main {
 
               }
             }
+
+            // idle sign resets so the same word can be signed again
+            if(res.classIndex == words.length-1 && res.confidences[res.classIndex] > predictionThreshold){
+              this.previousPrediction = res.classIndex
+            }
           })
+          .catch((err) => console.log(err))
           .then(() => image.dispose())
         } else {
           image.dispose()
@@ -463,10 +495,11 @@ class TextToSpeech{
     this.waitTimeForQuery = 5000
 
 
+    this.populateVoiceList()
     this.synth.onvoiceschanged = () => {
       this.populateVoiceList()
     }
-    
+
   }
 
   populateVoiceList(){
@@ -476,12 +509,18 @@ class TextToSpeech{
     }
     this.voices = this.synth.getVoices()
 
-    if(this.voices.indexOf(this.selectedVoice) > 0){
-      console.log(`${this.voices[this.selectedVoice].name}:${this.voices[this.selectedVoice].lang}`)
-    } else {
-      //alert("Selected voice for speech did not load or does not exist.\nCheck Internet Connection")
+    if(!this.voices[this.selectedVoice]){
+      // fall back to a US English voice, then any English voice, then the default
+      let idx = this.voices.findIndex(v => v.lang == 'en-US' && v.name.indexOf('Google') != -1)
+      if(idx == -1) idx = this.voices.findIndex(v => v.lang == 'en-US')
+      if(idx == -1) idx = this.voices.findIndex(v => v.lang.indexOf('en') == 0)
+      this.selectedVoice = idx
     }
-    
+
+    if(this.voices[this.selectedVoice]){
+      console.log(`${this.voices[this.selectedVoice].name}:${this.voices[this.selectedVoice].lang}`)
+    }
+
   }
 
   clearPara(queryDetected){
@@ -509,7 +548,7 @@ class TextToSpeech{
           this.clearPara(false)
         }
       }, this.waitTimeForQuery)
-    } 
+    }
 
     if(word != 'alexa' && this.currentPredictedWords.length == 0){
       console.log("first word should be alexa")
@@ -553,7 +592,11 @@ class TextToSpeech{
       console.log("Error speaking")
     }
 
-    utterThis.voice = this.voices[this.selectedVoice]
+    if(this.voices[this.selectedVoice]){
+      utterThis.voice = this.voices[this.selectedVoice]
+    }
+    // keep a reference so Chrome doesn't garbage collect it before onend fires
+    this.currentUtterance = utterThis
 
     utterThis.pitch = this.pitch
     utterThis.rate = this.rate
@@ -573,7 +616,14 @@ class SpeechToText{
     this.finalTranscript = ''
     this.recognizing = false
 
-    this.recognition = new webkitSpeechRecognition();
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if(!Recognition){
+      this.type("Speech recognition is not supported in this browser (use Chrome)")
+      main.startPredicting()
+      return
+    }
+
+    this.recognition = new Recognition();
 
     this.recognition.continuous = true;
     this.recognition.interimResults = true;
@@ -589,7 +639,7 @@ class SpeechToText{
     }
 
     this.recognition.onerror = (evt) => {
-      console.log(evt + " recogn error")
+      console.log(evt.error + " recogn error")
     }
 
     this.recognition.onend = () => {
@@ -612,7 +662,7 @@ class SpeechToText{
       if(typeof(event.results) == 'undefined'){
         return;
       }
-   
+
 
       for (var i = event.resultIndex; i < event.results.length; ++i) {
         if (event.results[i].isFinal) {
@@ -630,7 +680,7 @@ class SpeechToText{
     setTimeout(()=>{
       this.startListening();
     },0)
-    
+
 
     setTimeout(()=>{
       this.stopListening()
@@ -647,17 +697,20 @@ class SpeechToText{
 
     main.pausePredicting()
 
-    this.recognition.start()
+    try {
+      this.recognition.start()
+    } catch(err) {
+      console.log(err)
+      main.startPredicting()
+    }
   }
 
   stopListening(){
     console.log("STOP LISTENING")
     if(this.recognizing){
       console.log("stop speech to text")
+      // onend restarts predicting
       this.recognition.stop()
-
-      //restart predicting
-      main.startPredicting()
       return
     }
   }
@@ -682,7 +735,7 @@ window.addEventListener('load', () => {
   if(!(ua.indexOf("chrome") != -1 || ua.indexOf("firefox")!= -1)){
     alert("Please visit in the latest Chrome or Firefox")
     return
-  } 
+  }
 
 
   main = new Main()

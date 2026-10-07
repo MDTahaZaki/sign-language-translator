@@ -19,6 +19,7 @@
 <nav role="tablist">
   <button role="tab" aria-selected="true" data-tab="train">1 &middot; TRAIN</button>
   <button role="tab" aria-selected="false" data-tab="sign">2 &middot; SIGN &rarr; SPEECH</button>
+  <button role="tab" aria-selected="false" data-tab="avatar">3 &middot; TEXT &rarr; SIGN</button>
   <button role="tab" aria-selected="false" data-tab="speech">SPEECH &rarr; TEXT</button>
   <button role="tab" aria-selected="false" data-tab="about">MODEL</button>
 </nav>
@@ -59,7 +60,9 @@
       <div id="trainErr"></div>
       <div class="row">
         <button class="ghost" id="btnGoSign">Done &rarr; start signing</button>
+        <button class="ghost" id="btnResetTraining">Reset all training</button>
       </div>
+      <p class="note" id="trainNote"></p>
     </div>
   </div>
 </section>
@@ -100,6 +103,61 @@
   </div>
 </section>
 
+<!-- ============================================ TEXT -> SIGN (avatar) -->
+<section class="panel" id="tab-avatar">
+  <div class="grid">
+    <div class="card">
+      <h2>Signing avatar</h2>
+      <div class="stage avatar-stage" id="avatarStage">
+        <div class="overlay">drag to turn &middot; double-click to reset</div>
+        <div class="caption" id="avatarCaption"></div>
+      </div>
+      <div class="row">
+        <button class="ghost" id="btnReplaySign">Replay</button>
+        <button class="ghost" id="btnStopSign">Stop</button>
+        <select id="signSpeed" aria-label="Signing speed">
+          <option value="0.6">0.6&times; speed</option>
+          <option value="0.8">0.8&times; speed</option>
+          <option value="1" selected>1&times; speed</option>
+          <option value="1.25">1.25&times; speed</option>
+        </select>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Type or say a sentence</h2>
+      <input type="text" id="signInput" placeholder="Where is the hospital?">
+      <div class="row">
+        <button class="act" id="btnSignIt">Sign it</button>
+        <button class="ghost" id="btnSignMic">Dictate</button>
+        <select id="signLang" aria-label="Dictation language">
+          <option value="en">English</option>
+          <option value="hi">हिन्दी</option>
+          <option value="kn">ಕನ್ನಡ</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="speakWhileSigning" checked> Speak the sentence while signing</label>
+      <h2 style="margin-top:16px">Try</h2>
+      <div class="examples" id="signExamples">
+        <button class="ghost">Hello, what is your name?</button>
+        <button class="ghost">Namaste, thank you</button>
+        <button class="ghost">Where is the hospital?</button>
+        <button class="ghost">I need water please</button>
+        <button class="ghost">I don't understand</button>
+        <button class="ghost">My name is Asha</button>
+        <button class="ghost">नमस्ते, मुझे पानी चाहिए</button>
+      </div>
+      <h2 style="margin-top:16px">Signs</h2>
+      <div class="chips" id="signChips"></div>
+      <div id="avatarErr"></div>
+      <p class="note">Articles and helper words (is, the, a&hellip;) are dropped, as in sign
+      grammar. Words outside the dictionary are fingerspelled letter by letter
+      (dashed chips). Signs are illustrative approximations.</p>
+      <h2 style="margin-top:14px">Dictionary &middot; <span id="signDictCount"></span> signs</h2>
+      <div class="vocab dict" id="signDict"></div>
+    </div>
+  </div>
+</section>
+
 <!-- ============================================ SPEECH -> TEXT -->
 <section class="panel" id="tab-speech">
   <div class="grid">
@@ -115,6 +173,10 @@
       </div>
       <h2 style="margin-top:16px">Transcript</h2>
       <div class="out big empty" id="transcript">Press start and speak. The words appear here for a deaf or hard-of-hearing reader.</div>
+      <div class="row">
+        <button class="ghost" id="btnTranscriptSign">Sign this with the avatar &rarr;</button>
+        <button class="ghost" id="btnTranscriptClear">Clear</button>
+      </div>
       <div id="speechErr"></div>
     </div>
     <div class="card">
@@ -135,8 +197,10 @@
   <div class="card">
     <h2>Pipeline</h2>
     <p class="note" style="font-size:12px;color:var(--dim)">
-    webcam &rarr; 227&times;227 centre crop &rarr; SqueezeNet features &rarr; k-nearest-neighbour (k=10)
-    &rarr; word &rarr; smoothing &rarr; sentence &rarr; speechSynthesis (en-IN / hi-IN / kn-IN)
+    <b>Sign &rarr; speech:</b> webcam &rarr; 227&times;227 centre crop &rarr; SqueezeNet features &rarr; k-nearest-neighbour (k=10)
+    &rarr; word &rarr; smoothing &rarr; sentence &rarr; speechSynthesis (en-IN / hi-IN / kn-IN)<br>
+    <b>Text &rarr; sign:</b> text or speech &rarr; gloss sequence (helper words dropped, EN / HI / KN lookup)
+    &rarr; sign dictionary or fingerspelling &rarr; keyframed 3D avatar (two-bone arm IK, 15-joint hands)
     </p>
     <h2 style="margin-top:18px">Vocabulary</h2>
     <div class="vocab" id="vocabList"></div>
@@ -145,7 +209,7 @@
     Everything runs in your browser; no video leaves this machine. Training is
     few-shot: each example is stored as a feature vector and new frames are
     classified by their 10 nearest stored examples, so adding a word needs no
-    retraining. Speech output and recognition use the browser's built-in voices &mdash;
+    retraining. Training is saved in this browser and restored on reload. Speech output and recognition use the browser's built-in voices &mdash;
     Chrome is required for recognition. For Hindi or Kannada output, add words in that
     script.
     </p>
@@ -155,5 +219,6 @@
 
 </div>
 <script src="dist/build.js"></script>
+<script type="module" src="avatar.js"></script>
 </body>
 </html>

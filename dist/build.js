@@ -118,6 +118,7 @@ function showTab(name) {
   if (slot) slot.appendChild($('#cameraCard'));
 
   if (name == 'about') renderAbout();
+  window.dispatchEvent(new CustomEvent('cognisign:tab', { detail: name }));
 }
 
 document.querySelectorAll('nav button').forEach(function (b) {
@@ -127,6 +128,19 @@ document.querySelectorAll('nav button').forEach(function (b) {
 });
 
 // ---------------------------------------------------------------- model
+// SqueezeNet weights ship in ./weights so the demo works offline; the library
+// hardcodes Google Cloud Storage, so requests are redirected to the local copy.
+var REMOTE_WEIGHTS = 'https://storage.googleapis.com/learnjs-data/checkpoint_zoo/';
+var useLocalWeights = true;
+var xhrOpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function (method, url) {
+  var args = Array.prototype.slice.call(arguments);
+  if (useLocalWeights && typeof url == 'string' && url.indexOf(REMOTE_WEIGHTS) == 0) {
+    args[1] = 'weights/' + url.slice(REMOTE_WEIGHTS.length);
+  }
+  return xhrOpen.apply(this, args);
+};
+
 function loadModel() {
   setStatus('loading model', 'busy');
   knn = new _deeplearnKnnImageClassifier.KNNImageClassifier(MAX_CLASSES, TOPK);
@@ -135,12 +149,104 @@ function loadModel() {
     $('#modelFlag').textContent = 'ready';
     $('#modelFlag').className = '';
     refreshStatus();
+    return restoreTraining();
   }).catch(function (err) {
     console.log(err);
+    if (useLocalWeights) {
+      console.log('local weights failed, trying the online copy');
+      useLocalWeights = false;
+      return loadModel();
+    }
     $('#modelFlag').textContent = 'failed';
     setStatus('model failed to load', 'err');
-    showErr('#camErr', 'The recognition model could not be downloaded. Check your internet connection and reload the page.');
+    showErr('#camErr', 'The recognition model could not be loaded. Check your internet connection and reload the page.');
   });
+}
+
+// ---------------------------------------------------------------- saved training
+// Examples are kept in IndexedDB so a page reload during a demo doesn't lose them.
+var DB_NAME = 'cognisign',
+    DB_STORE = 'training',
+    DB_KEY = 'v1';
+
+function openDB() {
+  return new Promise(function (resolve, reject) {
+    if (!window.indexedDB) return reject(new Error('no indexedDB'));
+    var req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = function () {
+      return req.result.createObjectStore(DB_STORE);
+    };
+    req.onsuccess = function () {
+      return resolve(req.result);
+    };
+    req.onerror = function () {
+      return reject(req.error);
+    };
+  });
+}
+
+function dbDo(mode, fn) {
+  return openDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(DB_STORE, mode);
+      var req = fn(tx.objectStore(DB_STORE));
+      tx.oncomplete = function () {
+        db.close();
+        resolve(req && req.result);
+      };
+      tx.onerror = function () {
+        db.close();
+        reject(tx.error);
+      };
+    });
+  });
+}
+
+var saveTimer = null;
+function saveTraining() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(function () {
+    if (!knn || !modelReady) return;
+    var c = counts();
+    var classes = [];
+    slots.forEach(function (w, i) {
+      var m = knn.classLogitsMatrices[i];
+      if (w !== null && c[i] > 0 && m) classes.push({ i: i, n: c[i], data: new Float32Array(m.dataSync()) });
+    });
+    dbDo('readwrite', function (store) {
+      return store.put({ slots: slots.slice(), classes: classes }, DB_KEY);
+    }).catch(function (err) {
+      return console.log('could not save training', err);
+    });
+  }, 400);
+}
+
+function restoreTraining() {
+  return dbDo('readonly', function (store) {
+    return store.get(DB_KEY);
+  }).then(function (saved) {
+    if (!saved || !saved.slots) return;
+    slots.length = 0;
+    saved.slots.forEach(function (w) {
+      return slots.push(w);
+    });
+    var total = 0;
+    saved.classes.forEach(function (cl) {
+      if (cl.i >= MAX_CLASSES || !cl.n) return;
+      knn.classLogitsMatrices[cl.i] = dl.tensor2d(cl.data, [cl.n, cl.data.length / cl.n]);
+      knn.classExampleCount[cl.i] = cl.n;
+      total += cl.n;
+    });
+    knn.clearTrainLogitsMatrix();
+    renderWords();
+    if (total) showNote('#trainNote', 'Restored your saved training (' + total + ' examples).');
+  }).catch(function (err) {
+    return console.log('could not restore training', err);
+  });
+}
+
+function showNote(id, msg) {
+  $(id).textContent = msg || '';
 }
 
 // ---------------------------------------------------------------- camera
@@ -431,6 +537,7 @@ function renderWords() {
     clear.addEventListener('click', function () {
       if (knn) knn.clearClass(i);
       updateCount(i, counts());
+      saveTraining();
     });
     row.appendChild(clear);
 
@@ -444,6 +551,7 @@ function renderWords() {
         if (knn) knn.clearClass(i);
         slots[i] = null;
         renderWords();
+        saveTraining();
       });
       row.appendChild(del);
     }
@@ -489,6 +597,7 @@ function stopRecording() {
   $('#recFlag').hidden = true;
   updateCount(i, counts());
   refreshStatus();
+  saveTraining();
 }
 window.addEventListener('blur', stopRecording);
 
@@ -506,6 +615,35 @@ $('#addWord').addEventListener('submit', function (e) {
   slots.push(word);
   input.value = '';
   renderWords();
+  saveTraining();
+});
+
+// two-step reset so it can't be hit by accident mid-demo
+var resetArmed = null;
+function disarmReset() {
+  clearTimeout(resetArmed);
+  resetArmed = null;
+  $('#btnResetTraining').textContent = 'Reset all training';
+  $('#btnResetTraining').classList.remove('danger');
+}
+$('#btnResetTraining').addEventListener('click', function () {
+  if (!resetArmed) {
+    $('#btnResetTraining').textContent = 'Click again to erase everything';
+    $('#btnResetTraining').classList.add('danger');
+    resetArmed = setTimeout(disarmReset, 3000);
+    return;
+  }
+  disarmReset();
+  stopRecording();
+  setPredicting(false);
+  if (knn) for (var i = 0; i < MAX_CLASSES; i++) {
+    knn.clearClass(i);
+  }slots.length = 0;['IDLE'].concat(DEFAULT_WORDS).forEach(function (w) {
+    return slots.push(w);
+  });
+  renderWords();
+  saveTraining();
+  showNote('#trainNote', 'Training erased.');
 });
 
 // ---------------------------------------------------------------- text to speech
@@ -753,6 +891,20 @@ function renderTranscript(interim) {
   });
 }
 
+$('#btnTranscriptSign').addEventListener('click', function () {
+  var text = micFinal.trim();
+  if (!text) return showErr('#speechErr', 'Nothing has been transcribed yet.');
+  if (!window.CogniAvatar) return showErr('#speechErr', 'The avatar is not available in this browser.');
+  stopMic();
+  showTab('avatar');
+  $('#signInput').value = text;
+  window.CogniAvatar.sign(text);
+});
+$('#btnTranscriptClear').addEventListener('click', function () {
+  micFinal = '';
+  renderTranscript('');
+});
+
 $('#btnSay').addEventListener('click', function () {
   return speak($('#sayText').value.trim(), $('#lang2').value);
 });
@@ -779,8 +931,11 @@ function renderAbout() {
   $('#healthOut').textContent = liveWords().length + ' words \xB7 ' + total + ' examples \xB7 model ' + (modelReady ? 'loaded' : 'loading') + ' \xB7 voices: ' + voiceInfo + ' \xB7 speech recognition ' + (Recognition ? 'available' : 'unavailable');
 }
 
-// ---------------------------------------------------------------- start
-function init() {
+// shared with avatar.js
+window.CogniSign = { speak: speak, showTab: showTab
+
+  // ---------------------------------------------------------------- start
+};function init() {
   showTab('train');
   renderWords();
   loadModel();

@@ -102,6 +102,7 @@ function showTab(name){
   if(slot) slot.appendChild($('#cameraCard'))
 
   if(name == 'about') renderAbout()
+  window.dispatchEvent(new CustomEvent('cognisign:tab', {detail: name}))
 }
 
 document.querySelectorAll('nav button').forEach((b) => {
@@ -109,6 +110,19 @@ document.querySelectorAll('nav button').forEach((b) => {
 })
 
 // ---------------------------------------------------------------- model
+// SqueezeNet weights ship in ./weights so the demo works offline; the library
+// hardcodes Google Cloud Storage, so requests are redirected to the local copy.
+const REMOTE_WEIGHTS = 'https://storage.googleapis.com/learnjs-data/checkpoint_zoo/'
+let useLocalWeights = true
+const xhrOpen = XMLHttpRequest.prototype.open
+XMLHttpRequest.prototype.open = function(method, url){
+  const args = Array.prototype.slice.call(arguments)
+  if(useLocalWeights && typeof url == 'string' && url.indexOf(REMOTE_WEIGHTS) == 0){
+    args[1] = 'weights/' + url.slice(REMOTE_WEIGHTS.length)
+  }
+  return xhrOpen.apply(this, args)
+}
+
 function loadModel(){
   setStatus('loading model', 'busy')
   knn = new KNNImageClassifier(MAX_CLASSES, TOPK)
@@ -118,13 +132,88 @@ function loadModel(){
     $('#modelFlag').textContent = 'ready'
     $('#modelFlag').className = ''
     refreshStatus()
+    return restoreTraining()
   })
   .catch((err) => {
     console.log(err)
+    if(useLocalWeights){
+      console.log('local weights failed, trying the online copy')
+      useLocalWeights = false
+      return loadModel()
+    }
     $('#modelFlag').textContent = 'failed'
     setStatus('model failed to load', 'err')
-    showErr('#camErr', 'The recognition model could not be downloaded. Check your internet connection and reload the page.')
+    showErr('#camErr', 'The recognition model could not be loaded. Check your internet connection and reload the page.')
   })
+}
+
+// ---------------------------------------------------------------- saved training
+// Examples are kept in IndexedDB so a page reload during a demo doesn't lose them.
+const DB_NAME = 'cognisign', DB_STORE = 'training', DB_KEY = 'v1'
+
+function openDB(){
+  return new Promise((resolve, reject) => {
+    if(!window.indexedDB) return reject(new Error('no indexedDB'))
+    const req = indexedDB.open(DB_NAME, 1)
+    req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE)
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+function dbDo(mode, fn){
+  return openDB().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, mode)
+    const req = fn(tx.objectStore(DB_STORE))
+    tx.oncomplete = () => {
+      db.close()
+      resolve(req && req.result)
+    }
+    tx.onerror = () => {
+      db.close()
+      reject(tx.error)
+    }
+  }))
+}
+
+let saveTimer = null
+function saveTraining(){
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => {
+    if(!knn || !modelReady) return
+    const c = counts()
+    const classes = []
+    slots.forEach((w, i) => {
+      const m = knn.classLogitsMatrices[i]
+      if(w !== null && c[i] > 0 && m) classes.push({i: i, n: c[i], data: new Float32Array(m.dataSync())})
+    })
+    dbDo('readwrite', (store) => store.put({slots: slots.slice(), classes: classes}, DB_KEY))
+    .catch((err) => console.log('could not save training', err))
+  }, 400)
+}
+
+function restoreTraining(){
+  return dbDo('readonly', (store) => store.get(DB_KEY))
+  .then((saved) => {
+    if(!saved || !saved.slots) return
+    slots.length = 0
+    saved.slots.forEach((w) => slots.push(w))
+    let total = 0
+    saved.classes.forEach((cl) => {
+      if(cl.i >= MAX_CLASSES || !cl.n) return
+      knn.classLogitsMatrices[cl.i] = dl.tensor2d(cl.data, [cl.n, cl.data.length / cl.n])
+      knn.classExampleCount[cl.i] = cl.n
+      total += cl.n
+    })
+    knn.clearTrainLogitsMatrix()
+    renderWords()
+    if(total) showNote('#trainNote', 'Restored your saved training (' + total + ' examples).')
+  })
+  .catch((err) => console.log('could not restore training', err))
+}
+
+function showNote(id, msg){
+  $(id).textContent = msg || ''
 }
 
 // ---------------------------------------------------------------- camera
@@ -411,6 +500,7 @@ function renderWords(){
     clear.addEventListener('click', () => {
       if(knn) knn.clearClass(i)
       updateCount(i, counts())
+      saveTraining()
     })
     row.appendChild(clear)
 
@@ -424,6 +514,7 @@ function renderWords(){
         if(knn) knn.clearClass(i)
         slots[i] = null
         renderWords()
+        saveTraining()
       })
       row.appendChild(del)
     }
@@ -467,6 +558,7 @@ function stopRecording(){
   $('#recFlag').hidden = true
   updateCount(i, counts())
   refreshStatus()
+  saveTraining()
 }
 window.addEventListener('blur', stopRecording)
 
@@ -482,6 +574,33 @@ $('#addWord').addEventListener('submit', (e) => {
   slots.push(word)
   input.value = ''
   renderWords()
+  saveTraining()
+})
+
+// two-step reset so it can't be hit by accident mid-demo
+let resetArmed = null
+function disarmReset(){
+  clearTimeout(resetArmed)
+  resetArmed = null
+  $('#btnResetTraining').textContent = 'Reset all training'
+  $('#btnResetTraining').classList.remove('danger')
+}
+$('#btnResetTraining').addEventListener('click', () => {
+  if(!resetArmed){
+    $('#btnResetTraining').textContent = 'Click again to erase everything'
+    $('#btnResetTraining').classList.add('danger')
+    resetArmed = setTimeout(disarmReset, 3000)
+    return
+  }
+  disarmReset()
+  stopRecording()
+  setPredicting(false)
+  if(knn) for(let i = 0; i < MAX_CLASSES; i++) knn.clearClass(i)
+  slots.length = 0
+  ;['IDLE'].concat(DEFAULT_WORDS).forEach((w) => slots.push(w))
+  renderWords()
+  saveTraining()
+  showNote('#trainNote', 'Training erased.')
 })
 
 // ---------------------------------------------------------------- text to speech
@@ -715,6 +834,20 @@ function renderTranscript(interim){
   })
 }
 
+$('#btnTranscriptSign').addEventListener('click', () => {
+  const text = micFinal.trim()
+  if(!text) return showErr('#speechErr', 'Nothing has been transcribed yet.')
+  if(!window.CogniAvatar) return showErr('#speechErr', 'The avatar is not available in this browser.')
+  stopMic()
+  showTab('avatar')
+  $('#signInput').value = text
+  window.CogniAvatar.sign(text)
+})
+$('#btnTranscriptClear').addEventListener('click', () => {
+  micFinal = ''
+  renderTranscript('')
+})
+
 $('#btnSay').addEventListener('click', () => speak($('#sayText').value.trim(), $('#lang2').value))
 $('#sayText').addEventListener('keydown', (e) => {
   if(e.key == 'Enter') speak($('#sayText').value.trim(), $('#lang2').value)
@@ -739,6 +872,9 @@ function renderAbout(){
     (modelReady ? 'loaded' : 'loading') + ' \u00b7 voices: ' + voiceInfo +
     ' \u00b7 speech recognition ' + (Recognition ? 'available' : 'unavailable')
 }
+
+// shared with avatar.js
+window.CogniSign = {speak: speak, showTab: showTab}
 
 // ---------------------------------------------------------------- start
 function init(){

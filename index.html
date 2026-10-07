@@ -1,76 +1,159 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="ie=edge">
-    <title>Alexa Sign Language Translator</title>
-    <link href="https://fonts.googleapis.com/css?family=Baloo+Bhaina" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
-    <script src="dist/build.js"></script> 
-    
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CogniSign</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div class="wrap">
 
+<header>
+  <h1>CogniSign</h1>
+  <span class="sub">SIGN &harr; EN / HI / KN &middot; in-browser</span>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">camera off</span></div>
+</header>
 
-  <!-- The Modal -->
-  <div id="launchModal" class="modal">
-    <!-- Modal content -->
-    <div class="modal-content">
-      <div class="modal-header">
-        <span id="close-modal">&times;</span>
-        <h2>Hey there!</h2>
+<nav role="tablist">
+  <button role="tab" aria-selected="true" data-tab="train">1 &middot; TRAIN</button>
+  <button role="tab" aria-selected="false" data-tab="sign">2 &middot; SIGN &rarr; SPEECH</button>
+  <button role="tab" aria-selected="false" data-tab="speech">SPEECH &rarr; TEXT</button>
+  <button role="tab" aria-selected="false" data-tab="about">MODEL</button>
+</nav>
+
+<!-- shared camera card: moved into whichever tab is active -->
+<div id="cameraHome" hidden>
+  <div class="card" id="cameraCard">
+    <h2>Camera</h2>
+    <div class="stage">
+      <video id="vid" playsinline muted></video>
+      <div class="overlay">
+        model <b id="modelFlag" class="no">not loaded</b><br>
+        <span id="fps">-- fps</span>
       </div>
-      <div class="modal-body">
-        <p>This project is an experiment that uses Tensorflow.js and your webcam to make Amazon Echo respond to sign language. It began with a simple question:</p> 
-        <p><b><em>"If voice is the future of computing what about those who cannot hear or speak?"</em></b></p>
-        <p>You can find the code for this demo on <a href="https://github.com/shekit/alexa-sign-language-translator" target="_blank">github</a> or watch a <a href="https://www.youtube.com/watch?v=kS53y6GWm0w" target="_blank">video</a> of it in action.</p>
-        <p style="font-size:12px;"><em>Note: This demo runs entirely in your browser without any data sent to any server</em></p>
+      <div class="recording" id="recFlag" hidden>&#9679; REC <span id="recWord"></span></div>
+    </div>
+    <div class="row">
+      <button class="act" id="btnCam">Start camera</button>
+    </div>
+    <div id="camErr"></div>
+  </div>
+</div>
+
+<!-- ============================================ TRAIN -->
+<section class="panel on" id="tab-train">
+  <div class="grid">
+    <div class="slot"></div>
+    <div class="card">
+      <h2>Your signs</h2>
+      <p class="note" style="margin-top:0">Hold <b>Record</b> while performing a sign
+      (aim for 30+ examples each). Record <b>IDLE</b> with your hands down &mdash; it
+      tells the model when you are <em>not</em> signing.</p>
+      <div id="wordList" class="words"></div>
+      <form id="addWord" class="row" autocomplete="off">
+        <input type="text" id="newWord" placeholder="Add a word, e.g. water / पानी / ನೀರು">
+        <button class="act" type="submit">Add</button>
+      </form>
+      <div id="trainErr"></div>
+      <div class="row">
+        <button class="ghost" id="btnGoSign">Done &rarr; start signing</button>
       </div>
     </div>
   </div>
+</section>
 
-  <div id="status">
-    <p id="status-text">Status: Not Ready</p>
-  </div>
-  <video id="video" src='' muted autoplay playsinline></video>
-  <div class="split-left">
-    <div class="centered">
-      <h1 id="text" class="intro-steps">Step 1: Enter Words<br><span class="subtext">Add a few words below. In the next step we'll associate each word with signs from the webcam</h1>
-      <div id="training-list">
-        <div id="example-list"></div>
-        <div id="add">
-          <form id="add-word" autocomplete="off">
-            <input type="text" id="new-word" placeholder="Add Training word">
-            <br/><br/>
-            <label>
-              <input type="checkbox" id="is-terminal-word">
-              Is terminal word?
-            </label>
-            <br/><br/>
-            <input type="submit" value="Add Word">
-            <p><b>Terminal Word</b> - A word that appears as the last word in your query</p>
-            <p>e.g If you intend to ask "What's <b><em>the weather</em></b>?" & "What's <b><em>the time</em></b>?" then <b><em>the weather</em></b> and <b><em>the time</em></b> are terminal words whereas <b><em>what's</em></b> is not</p>
-          </form>
-        </div>
-        <p id="count">Training: 3 words</p>
-        <div id="action-btn"></div>
+<!-- ============================================ SIGN -> SPEECH -->
+<section class="panel" id="tab-sign">
+  <div class="grid">
+    <div class="slot"></div>
+    <div class="card">
+      <h2>Detected words</h2>
+      <div class="chips" id="chips"></div>
+      <div class="live-pred">
+        <span id="livePred">waiting for signs</span>
+        <div class="bar"><i id="liveBar" style="width:0"></i></div>
       </div>
-      
+      <h2 style="margin-top:16px">Sentence</h2>
+      <div class="out empty" id="sentence">Sign to begin. Return to idle for a moment to end a sentence.</div>
+      <div class="row">
+        <button class="act" id="btnPredict">Start predicting</button>
+        <button class="ghost" id="btnSpeak">Speak aloud</button>
+        <button class="ghost" id="btnClear">Clear</button>
+        <select id="lang" aria-label="Speech language">
+          <option value="en">English</option>
+          <option value="hi">हिन्दी</option>
+          <option value="kn">ಕನ್ನಡ</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="autoSpeak" checked> Speak each sentence automatically</label>
+      <label class="check"><input type="checkbox" id="listenReply"> Listen for a spoken reply afterwards (e.g. from Alexa)</label>
+      <div id="replyBox" hidden>
+        <h2 style="margin-top:14px">Reply</h2>
+        <div class="out empty" id="reply">listening&hellip;</div>
+      </div>
+      <div id="signErr"></div>
+      <p class="note">A word is accepted only above 90% confidence, held steady across
+      3 consecutive frames. Holding IDLE for 1.5s closes the sentence and speaks it.</p>
     </div>
   </div>
-  <div class="split-right">
-    <div class="centered">
-      <div id="loader"></div>
-      <h1>
-        <span id="answerText"></span>
-        <span id="interimText"></span>
-      </h1>
-    </div>
-  </div>
-  
-  
-  
+</section>
 
+<!-- ============================================ SPEECH -> TEXT -->
+<section class="panel" id="tab-speech">
+  <div class="grid">
+    <div class="card">
+      <h2>Listen</h2>
+      <div class="row" style="margin-top:0">
+        <button class="act" id="btnMic">Start listening</button>
+        <select id="lang2" aria-label="Recognition language">
+          <option value="en">English</option>
+          <option value="hi">हिन्दी</option>
+          <option value="kn">ಕನ್ನಡ</option>
+        </select>
+      </div>
+      <h2 style="margin-top:16px">Transcript</h2>
+      <div class="out big empty" id="transcript">Press start and speak. The words appear here for a deaf or hard-of-hearing reader.</div>
+      <div id="speechErr"></div>
+    </div>
+    <div class="card">
+      <h2>Type to speak</h2>
+      <input type="text" id="sayText" placeholder="Type something to say out loud">
+      <div class="row">
+        <button class="act" id="btnSay">Speak</button>
+      </div>
+      <h2 style="margin-top:16px">Your signs in the transcript</h2>
+      <div class="chips" id="chips2"></div>
+      <p class="note">Words from the transcript that match a sign you trained.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================ ABOUT -->
+<section class="panel" id="tab-about">
+  <div class="card">
+    <h2>Pipeline</h2>
+    <p class="note" style="font-size:12px;color:var(--dim)">
+    webcam &rarr; 227&times;227 centre crop &rarr; SqueezeNet features &rarr; k-nearest-neighbour (k=10)
+    &rarr; word &rarr; smoothing &rarr; sentence &rarr; speechSynthesis (en-IN / hi-IN / kn-IN)
+    </p>
+    <h2 style="margin-top:18px">Vocabulary</h2>
+    <div class="vocab" id="vocabList"></div>
+    <h2 style="margin-top:18px">Notes</h2>
+    <p class="note" style="font-size:12px;color:var(--dim)">
+    Everything runs in your browser; no video leaves this machine. Training is
+    few-shot: each example is stored as a feature vector and new frames are
+    classified by their 10 nearest stored examples, so adding a word needs no
+    retraining. Speech output and recognition use the browser's built-in voices &mdash;
+    Chrome is required for recognition. For Hindi or Kannada output, add words in that
+    script.
+    </p>
+    <div id="healthOut" class="note" style="font-size:11px"></div>
+  </div>
+</section>
+
+</div>
+<script src="dist/build.js"></script>
 </body>
 </html>

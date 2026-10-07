@@ -1,41 +1,39 @@
-# Making Alexa respond to Sign Language using Tensorflow.js
+# CogniSign — browser demo
 
-![Alt Text](https://i.imgur.com/CbvRZIY.gif)
+Teach your own signs to the webcam, then sign sentences that are spoken aloud in
+English, Hindi or Kannada. Everything runs in the browser; no video leaves the machine.
 
-**[Try the live demo](https://shekit.github.io/alexa-sign-language-translator/)**
+Based on the [Alexa sign language translator](https://github.com/shekit/alexa-sign-language-translator)
+(KNN image classifier on SqueezeNet features), with the CogniSign interface and speech layer.
 
-**[Read the Blog Post on Tensorflow's Blog]() Coming Soon**
-
-**[Watch the video](https://www.youtube.com/watch?v=kS53y6GWm0w)**
-
-This project has been shared extensively across [social media](https://twitter.com/shekitup/status/1017072947624857605), and covered in the press: [BBC](https://www.bbc.com/news/technology-44891054), [Verge](https://www.theverge.com/2018/7/24/17606614/amazon-alexa-echo-mod-sign-language-gestures-ai), [Mashable](https://mashable.com/video/amazon-alexa-sign-language/), [Fast Co](https://www.fastcompany.com/90202730/this-clever-app-lets-amazon-alexa-read-sign-language), [Kottke](https://kottke.org/18/07/making-amazon-alexa-respond-to-sign-language-using-ai), [VentureBeat](https://venturebeat.com/2018/07/24/amazon-alexa-mod-turns-sign-language-into-voice-commands/), [NowThis](https://www.facebook.com/NowThisFuture/videos/alexa-can-now-understand-sign/2221206704587164/) and others  
-
-Run the demo in latest Chrome/Firefox to train the model using your own words and corresponding signs/gestures. If you have an Echo plugged in closeby, it should respond, otherwise simply play around and have fun. You will need to give permission to access your webcam and microphone.
-
-
-## Running the code
-To use the code, first install the JavaScript dependencies by running  
+## Running
 
 ```
 npm install
-```
-
-Then start the local budo web server by running 
-
-```
 npm start
 ```
 
-This will start a web server on [`localhost:9966`](http://localhost:9966). 
+Open [`http://localhost:9966`](http://localhost:9966) in **Chrome** and allow the camera
+(and the microphone, for the speech features).
 
-1. Allow permission to your webcam and microphone. 
+`npm run build` regenerates `dist/build.js` after editing `main.js`.
 
-2. Add some words you want to train on. 
+## Using it
 
-![Alt Text](https://i.imgur.com/zk3kwIZ.gif)
+1. **Train** — start the camera, then hold **Record** next to each word while performing
+   its sign (30+ examples each). Record **IDLE** with your hands down so the model knows
+   when you are not signing. Add your own words at any time; type them in Devanagari or
+   Kannada script to have them spoken in that language.
+2. **Sign → Speech** — detected words appear as chips. A word is accepted at ≥90%
+   confidence held for 3 frames; holding IDLE for 1.5s ends the sentence and speaks it.
+   Optionally listen for a spoken reply afterwards (e.g. from an Amazon Echo).
+3. **Speech → Text** — live transcription (en-IN / hi-IN / kn-IN) for a deaf or
+   hard-of-hearing reader, plus type-to-speak.
+4. **Model** — vocabulary, example counts, and which voices are installed.
 
-## Reference
-To learn more about the classifier used in this repo go to [KNN Image Classifier](https://github.com/PAIR-code/deeplearnjs/tree/master/models/knn_image_classifier)
+## Notes
 
-There is a newer version of this classifier released in the new [tensorflow.js](https://js.tensorflow.org) which can be found [here](https://github.com/tensorflow/tfjs-models/tree/master/knn-classifier)
-
+- Speech recognition only works in Chrome and needs an internet connection.
+- Voices come from the OS/browser. If a language shows ✗ on the Model tab, install it in
+  Windows Settings → Time & language → Speech, then restart Chrome.
+- Training is held in memory; reloading the page clears it.

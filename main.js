@@ -1,744 +1,755 @@
-// Launch in kiosk mode
-// /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --kiosk --app=http://localhost:9966
-
+// CogniSign (browser demo)
+// webcam -> 227x227 crop -> SqueezeNet features -> KNN -> smoothed words -> sentence -> speech
+// Launch in kiosk mode:
+// "C:\Program Files\Google\Chrome\Application\chrome.exe" --kiosk --app=http://localhost:9966
 
 import {KNNImageClassifier} from 'deeplearn-knn-image-classifier';
 import * as dl from 'deeplearn';
 
+// ---------------------------------------------------------------- config
+const IMAGE_SIZE = 227        // SqueezeNet input size. Must be 227.
+const TOPK = 10               // K value for KNN
+const MAX_CLASSES = 40        // slots reserved up front so words can be added any time
+const IDLE = 0                // class 0 is always the idle / not-signing class
 
-// Webcam Image size. Must be 227.
-const IMAGE_SIZE = 227;
-// K value for KNN
-const TOPK = 10;
+const CONF_THRESHOLD = 0.9    // min KNN vote share to accept a word
+const STABLE_FRAMES = 3       // consecutive agreeing predictions required
+const SENTENCE_GAP_MS = 1500  // no confident sign for this long ends the sentence
+const PREDICT_INTERVAL_MS = 100
+const REPLY_CUTOFF_MS = 15000
 
-const predictionThreshold = 0.98
+const LANG_CODES = {en: 'en-IN', hi: 'hi-IN', kn: 'kn-IN'}
+const LANG_NAMES = {en: 'English', hi: 'Hindi', kn: 'Kannada'}
 
-var words = ["alexa", "hello", "other"]
-// var words = ["alexa", "hello", "what is", "the weather", "the time",
-//"add","eggs","to the list","five","feet","in meters","tell me","a joke", "bye", "other"]
+const DEFAULT_WORDS = ['hello', 'yes', 'no', 'thank you']
 
+const $ = (s) => document.querySelector(s)
 
-// words from above array which act as terminal words in a sentence
-var endWords = ["hello"]
+// ---------------------------------------------------------------- state
+// slots[i] is the word for KNN class i (null once removed, so indices never shift)
+const slots = ['IDLE'].concat(DEFAULT_WORDS)
 
-class LaunchModal {
-  constructor(){
-    this.modalWindow = document.getElementById('launchModal')
+let knn = null
+let modelReady = false
+let camOn = false
+let recording = -1            // class index being recorded, -1 when none
+let predicting = false
+let predictBusy = false
+let lastPredictAt = 0
 
-    this.closeBtn = document.getElementById('close-modal')
+let candidate = -1, candidateCount = 0
+let lastAccepted = -1
+let lastSignAt = 0
+let buffer = []
+let chipsStale = false
+let pausedForReply = false
 
-    this.closeBtn.addEventListener('click', (e) => {
-      this.modalWindow.style.display = "none"
-    })
+let processed = 0, fpsT = performance.now()
 
-    window.addEventListener('click', (e) => {
-      if(e.target == this.modalWindow){
-        this.modalWindow.style.display = "none"
-      }
-    })
+const cropCanvas = document.createElement('canvas')
+cropCanvas.width = IMAGE_SIZE
+cropCanvas.height = IMAGE_SIZE
+const cropCtx = cropCanvas.getContext('2d')
 
-    this.modalWindow.style.display = "block"
-    this.modalWindow.style.zIndex = 500
-  }
+// ---------------------------------------------------------------- helpers
+function setStatus(text, cls){
+  $('#statusText').textContent = text
+  $('#dot').className = 'dot ' + (cls || '')
 }
 
-
-class Main {
-  constructor(){
-    // Initiate variables
-    this.infoTexts = [];
-    this.training = -1; // -1 when no class is being trained
-    this.videoPlaying = false;
-
-    this.previousPrediction = -1
-    this.currentPredictedWords = []
-
-    // variables to restrict prediction rate
-    this.now;
-    this.then = Date.now()
-    this.startTime = this.then;
-    this.fps = 5; //framerate - number of prediction per second
-    this.fpsInterval = 1000/(this.fps);
-    this.elapsed = 0;
-
-    this.trainingListDiv = document.getElementById("training-list")
-    this.exampleListDiv = document.getElementById("example-list")
-
-    this.knn = null
-
-    this.textLine = document.getElementById("text")
-
-    // Get video element that will contain the webcam image
-    this.video = document.getElementById('video');
-
-    this.addWordForm = document.getElementById("add-word")
-
-    this.statusText = document.getElementById("status-text")
-
-    this.video.addEventListener('mousedown', () => {
-      // click on video to go back to training buttons
-      if(!this.knn) return
-      this.pausePredicting();
-      this.trainingListDiv.style.display = "block"
-      this.textLine.innerText = "Step 2: Train"
-      this.startTraining()
-    })
-
-    // add word to training example set
-    this.addWordForm.addEventListener('submit', (e) => {
-      e.preventDefault();
-      let word = document.getElementById("new-word").value.trim().toLowerCase();
-      let checkbox = document.getElementById("is-terminal-word")
-
-      if(word && !words.includes(word)){
-        //console.log(word)
-        words.splice(words.length-1,0,word) //insert at penultimate index in array
-        this.createButtonList(false)
-        this.updateExampleCount()
-        //console.log(words)
-
-
-        if(checkbox.checked){
-          endWords.push(word)
-        }
-
-        document.getElementById("new-word").value = ''
-        checkbox.checked = false;
-
-        // console.log(words)
-        // console.log(endWords)
-
-      } else {
-        alert("Duplicate word or no word entered")
-      }
-
-      return
-    })
-
-    // show modal window
-    let modal = new LaunchModal()
-
-    this.updateExampleCount()
-
-    document.getElementById("status").style.display = "none"
-
-    this.createTrainingBtn()
-
-    this.createButtonList(false)
-
-    // load text to speech
-    this.tts = new TextToSpeech()
-
-  }
-
-  createPredictBtn(){
-    var div = document.getElementById("action-btn")
-    div.innerHTML = ""
-    const predButton = document.createElement('button')
-
-    predButton.innerText = "Start Predicting >>>"
-    div.appendChild(predButton);
-
-    predButton.addEventListener('mousedown', () => {
-      console.log("start predicting")
-      const exampleCount = this.knn.getClassExampleCount()
-
-      // check if training has been done
-      if(Math.max(...exampleCount) > 0){
-
-        // if wake word has not been trained
-        if(exampleCount[0] == 0){
-          alert(
-            `You haven't added examples for the wake word ALEXA`
-            )
-          return
-        }
-
-        // if the catchall phrase other hasnt been trained
-        if(exampleCount[words.length-1] == 0){
-          alert(
-            `You haven't added examples for the catchall sign OTHER.\n\nCapture yourself in idle states e.g hands by your side, empty background etc.\n\nThis prevents words from being erroneously detected.`)
-          return
-        }
-
-        // check if atleast one terminal word has been trained
-        if(!this.areTerminalWordsTrained(exampleCount)){
-          alert(
-            `Add examples for atleast one terminal word.\n\nA terminal word is a word that appears at the end of a query and is necessary to trigger transcribing. e.g What is *the weather*\n\nYour terminal words are: ${endWords}`
-            )
-          return
-        }
-
-        this.trainingListDiv.style.display = "none"
-        this.textLine.classList.remove("intro-steps")
-        this.textLine.innerText = "Sign your query"
-        this.startPredicting()
-      } else {
-        alert(
-          `You haven't added any examples yet.\n\nPress and hold on the "Add Example" button next to each word while performing the sign in front of the webcam.`
-          )
-      }
-    })
-  }
-
-  createTrainingBtn(){
-    var div = document.getElementById("action-btn")
-    div.innerHTML = ""
-
-    const trainButton = document.createElement('button')
-    trainButton.innerText = "Training >>>"
-    div.appendChild(trainButton);
-
-
-    trainButton.addEventListener('mousedown', () => {
-
-      // check if user has added atleast one terminal word
-      if(words.length > 3 && endWords.length == 1){
-        console.log('no terminal word added')
-        alert(`You have not added any terminal words.\nCurrently the only query you can make is "Alexa, hello".\n\nA terminal word is a word that will appear in the end of your query.\nIf you intend to ask "What's the weather" & "What's the time" then add "the weather" and "the time" as terminal words. "What's" on the other hand is not a terminal word.`)
-        return
-      }
-
-      if(words.length == 3 && endWords.length ==1){
-        var proceed = confirm("You have not added any words.\n\nThe only query you can currently make is: 'Alexa, hello'")
-
-        if(!proceed) return
-      }
-
-      this.startWebcam()
-
-      console.log("ready to train")
-      this.createButtonList(true)
-      this.addWordForm.innerHTML = ''
-      let p = document.createElement('p')
-      p.innerText = `Perform the appropriate sign while holding down the ADD EXAMPLE button near each word to capture atleast 30 training examples for each word
-
-      For OTHER, capture yourself in an idle state to act as a catchall sign. e.g hands down by your side`
-      this.addWordForm.appendChild(p)
-
-      this.loadKNN()
-
-      this.createPredictBtn()
-
-      this.textLine.innerText = "Step 2: Train"
-
-      let subtext = document.createElement('span')
-      subtext.innerHTML = "<br/>Time to associate signs with the words"
-      subtext.classList.add('subtext')
-      this.textLine.appendChild(subtext)
-
-    })
-  }
-
-  areTerminalWordsTrained(exampleCount){
-
-    var totalTerminalWordsTrained = 0
-
-    for(var i=0;i<words.length;i++){
-      if(endWords.includes(words[i])){
-        if(exampleCount[i] > 0){
-          totalTerminalWordsTrained+=1
-        }
-      }
-    }
-
-    return totalTerminalWordsTrained
-  }
-
-  startWebcam(){
-    // Setup webcam
-    navigator.mediaDevices.getUserMedia({video: {facingMode: 'user'}, audio: false})
-    .then((stream) => {
-      this.video.srcObject = stream;
-      this.video.width = IMAGE_SIZE;
-      this.video.height = IMAGE_SIZE;
-
-      this.video.addEventListener('playing', ()=> this.videoPlaying = true);
-      this.video.addEventListener('pause', ()=> this.videoPlaying = false);
-    })
-    .catch((err) => {
-      console.log(err)
-      alert("Could not access the webcam.\n\nPlease allow camera access and make sure no other app is using it, then reload the page.\n\n" + err.name)
-    })
-  }
-
-  loadKNN(){
-
-    this.knn = new KNNImageClassifier(words.length, TOPK);
-
-    // Load knn model
-    this.setStatusText("Status: Loading model...")
-    this.knn.load()
-    .then(() => {
-      this.setStatusText("Status: Model loaded - Training")
-      this.startTraining()
-    })
-    .catch((err) => {
-      console.log(err)
-      this.setStatusText("Status: Model failed to load")
-      alert("Failed to load the model. Check your internet connection and reload the page.")
-    })
-  }
-
-  updateExampleCount(){
-    var p = document.getElementById('count')
-    p.innerText = `Training: ${words.length} words`
-  }
-
-  createButtonList(showBtn){
-    //showBtn - true: show training btns, false:show only text
-
-    // Clear List
-    this.exampleListDiv.innerHTML = ""
-    this.infoTexts = []
-
-    // Create training buttons and info texts
-    for(let i=0;i<words.length; i++){
-      this.createButton(i, showBtn)
-    }
-  }
-
-  createButton(i, showBtn){
-    const div = document.createElement('div');
-    this.exampleListDiv.appendChild(div);
-    div.style.marginBottom = '10px';
-
-    // Create Word Text
-    const wordText = document.createElement('span')
-
-    if(i==0 && !showBtn){
-      wordText.innerText = words[i].toUpperCase()+" (wake word) "
-    } else if(i==words.length-1 && !showBtn){
-      wordText.innerText = words[i].toUpperCase()+" (catchall sign) "
-    } else {
-      wordText.innerText = words[i].toUpperCase()+" "
-      wordText.style.fontWeight = "bold"
-    }
-
-
-    div.appendChild(wordText);
-
-    if(showBtn){
-      // Create training button
-      const button = document.createElement('button')
-      button.innerText = "Add Example"//"Train " + words[i].toUpperCase()
-      div.appendChild(button);
-
-      // Listen for mouse events when clicking the button
-      const startAdding = (e) => { e.preventDefault(); this.training = i }
-      const stopAdding = () => this.training = -1
-      button.addEventListener('mousedown', startAdding);
-      button.addEventListener('touchstart', startAdding);
-      button.addEventListener('mouseup', stopAdding);
-      button.addEventListener('mouseleave', stopAdding);
-      button.addEventListener('touchend', stopAdding);
-      button.addEventListener('touchcancel', stopAdding);
-
-      // Create clear button to emove training examples
-      const btn = document.createElement('button')
-      btn.innerText = "Clear"//`Clear ${words[i].toUpperCase()}`
-      div.appendChild(btn);
-
-      btn.addEventListener('mousedown', () => {
-        console.log("clear training data for this label")
-        if(this.knn) this.knn.clearClass(i)
-        this.infoTexts[i].innerText = " 0 examples"
-      })
-
-      // Create info text
-      const infoText = document.createElement('span')
-      infoText.innerText = " 0 examples";
-      div.appendChild(infoText);
-      this.infoTexts.push(infoText);
-    }
-  }
-
-  startTraining(){
-    if (this.timer) {
-      this.stopTraining();
-    }
-    var promise = this.video.play();
-
-    if(promise !== undefined){
-      promise.then(_ => {
-        console.log("Autoplay started")
-      }).catch(error => {
-        console.log("Autoplay prevented")
-      })
-    }
-    this.timer = requestAnimationFrame(this.train.bind(this));
-  }
-
-  stopTraining(){
-    this.video.pause();
-    cancelAnimationFrame(this.timer);
-  }
-
-  train(){
-    if(this.videoPlaying && this.video.readyState >= 2){
-      // Get image data from video element
-      const image = dl.fromPixels(this.video);
-
-      // Train class if one of the buttons is held down
-      if(this.training != -1){
-        // Add current image to classifier
-        this.knn.addImage(image, this.training)
-      }
-      image.dispose()
-
-      const exampleCount = this.knn.getClassExampleCount()
-
-      if(Math.max(...exampleCount) > 0){
-        for(let i=0;i<words.length;i++){
-          if(exampleCount[i] > 0){
-            this.infoTexts[i].innerText = ` ${exampleCount[i]} examples`
-          }
-        }
-      }
-    }
-    this.timer = requestAnimationFrame(this.train.bind(this));
-  }
-
-  startPredicting(){
-    // stop training
-    if(this.timer){
-      this.stopTraining();
-    }
-
-    cancelAnimationFrame(this.pred)
-
-    document.getElementById("status").style.background = "deepskyblue"
-    this.setStatusText("Status: Ready!")
-
-    this.video.play();
-
-    this.pred = requestAnimationFrame(this.predict.bind(this))
-  }
-
-  pausePredicting(){
-    console.log("pause predicting")
-    this.setStatusText("Status: Paused Predicting")
-    cancelAnimationFrame(this.pred)
-  }
-
-  predict(){
-    this.now = Date.now()
-    this.elapsed = this.now - this.then
-
-    if(this.elapsed > this.fpsInterval){
-
-      this.then = this.now - (this.elapsed % this.fpsInterval)
-
-      if(this.videoPlaying && this.video.readyState >= 2){
-        const exampleCount = this.knn.getClassExampleCount();
-
-        const image = dl.fromPixels(this.video);
-
-        if(Math.max(...exampleCount) > 0){
-          this.knn.predictClass(image)
-          .then((res) => {
-            for(let i=0;i<words.length;i++){
-
-              // if matches & is above threshold & isnt same as prev prediction
-              // and is not the last class which is a catch all class
-              if(res.classIndex == i
-                && res.confidences[i] > predictionThreshold
-                && res.classIndex != this.previousPrediction
-                && res.classIndex != words.length-1){
-
-                this.tts.speak(words[i])
-
-                // set previous prediction so it doesnt get called again
-                this.previousPrediction = res.classIndex;
-
-
-              }
-            }
-
-            // idle sign resets so the same word can be signed again
-            if(res.classIndex == words.length-1 && res.confidences[res.classIndex] > predictionThreshold){
-              this.previousPrediction = res.classIndex
-            }
-          })
-          .catch((err) => console.log(err))
-          .then(() => image.dispose())
-        } else {
-          image.dispose()
-        }
-      }
-    }
-
-    this.pred = requestAnimationFrame(this.predict.bind(this))
-  }
-
-  setStatusText(status){
-    document.getElementById("status").style.display = "block"
-    this.statusText.innerText = status
-  }
-
+function showErr(id, msg){
+  const box = $(id)
+  box.innerHTML = ''
+  if(!msg) return
+  const div = document.createElement('div')
+  div.className = 'err'
+  div.textContent = msg
+  box.appendChild(div)
 }
 
-class TextToSpeech{
-  constructor(){
-    this.synth = window.speechSynthesis
-    this.voices = []
-    this.pitch = 1.0
-    this.rate = 0.9
-
-    this.textLine = document.getElementById("text")
-    this.ansText = document.getElementById("answerText")
-    this.loader = document.getElementById("loader")
-
-    this.selectedVoice = 48 // this is Google-US en. Can set voice and language of choice
-
-    this.currentPredictedWords = []
-    this.waitTimeForQuery = 5000
-
-
-    this.populateVoiceList()
-    this.synth.onvoiceschanged = () => {
-      this.populateVoiceList()
-    }
-
-  }
-
-  populateVoiceList(){
-    if(typeof speechSynthesis === 'undefined'){
-      console.log("no synth")
-      return
-    }
-    this.voices = this.synth.getVoices()
-
-    if(!this.voices[this.selectedVoice]){
-      // fall back to a US English voice, then any English voice, then the default
-      let idx = this.voices.findIndex(v => v.lang == 'en-US' && v.name.indexOf('Google') != -1)
-      if(idx == -1) idx = this.voices.findIndex(v => v.lang == 'en-US')
-      if(idx == -1) idx = this.voices.findIndex(v => v.lang.indexOf('en') == 0)
-      this.selectedVoice = idx
-    }
-
-    if(this.voices[this.selectedVoice]){
-      console.log(`${this.voices[this.selectedVoice].name}:${this.voices[this.selectedVoice].lang}`)
-    }
-
-  }
-
-  clearPara(queryDetected){
-    this.textLine.innerText = '';
-    this.ansText.innerText = ''
-    if(queryDetected){
-      this.loader.style.display = "block"
-    } else {
-      this.loader.style.display = "none"
-      this.ansText.innerText = "No query detected"
-      main.previousPrediction = -1
-    }
-    this.currentPredictedWords = []
-  }
-
-  speak(word){
-
-    if(word == 'alexa'){
-      console.log("clear para")
-      this.clearPara(true);
-
-      setTimeout(() => {
-        // if no query detected after alexa is signed
-        if(this.currentPredictedWords.length == 1){
-          this.clearPara(false)
-        }
-      }, this.waitTimeForQuery)
-    }
-
-    if(word != 'alexa' && this.currentPredictedWords.length == 0){
-      console.log("first word should be alexa")
-      console.log(word)
-      return
-    }
-
-    // if(endWords.includes(word) && this.currentPredictedWords.length == 1 && (word != "hello" && word != "bye")){
-    //   console.log("end word detected early")
-    //   console.log(word)
-    //   return;
-    // }
-
-    if(this.currentPredictedWords.includes(word)){
-      // prevent word from being detected repeatedly in phrase
-      console.log("word already been detected in current phrase")
-      return
-    }
-
-
-    this.currentPredictedWords.push(word)
-
-
-    this.textLine.innerText += ' ' + word;
-
-
-    var utterThis = new SpeechSynthesisUtterance(word)
-
-    utterThis.onend = (evt) => {
-      if(endWords.includes(word)){
-         //if last word is one of end words start listening for transcribing
-        console.log("this was the last word")
-
-        main.setStatusText("Status: Waiting for Response")
-
-        let stt = new SpeechToText()
-      }
-    }
-
-    utterThis.onerror = (evt) => {
-      console.log("Error speaking")
-    }
-
-    if(this.voices[this.selectedVoice]){
-      utterThis.voice = this.voices[this.selectedVoice]
-    }
-    // keep a reference so Chrome doesn't garbage collect it before onend fires
-    this.currentUtterance = utterThis
-
-    utterThis.pitch = this.pitch
-    utterThis.rate = this.rate
-
-    this.synth.speak(utterThis)
-
-  }
-
-
+function counts(){
+  return knn ? knn.getClassExampleCount() : slots.map(() => 0)
 }
 
-class SpeechToText{
-  constructor(){
-    this.interimTextLine = document.getElementById("interimText")
-    this.textLine = document.getElementById("answerText")
-    this.loader = document.getElementById("loader")
-    this.finalTranscript = ''
-    this.recognizing = false
-
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
-    if(!Recognition){
-      this.type("Speech recognition is not supported in this browser (use Chrome)")
-      main.startPredicting()
-      return
-    }
-
-    this.recognition = new Recognition();
-
-    this.recognition.continuous = true;
-    this.recognition.interimResults = true;
-
-    this.recognition.lang = 'en-US'
-
-    this.cutOffTime = 15000 // cut off speech to text after
-
-    this.recognition.onstart = () => {
-      this.recognizing = true;
-      console.log("started recognizing")
-      main.setStatusText("Status: Transcribing")
-    }
-
-    this.recognition.onerror = (evt) => {
-      console.log(evt.error + " recogn error")
-    }
-
-    this.recognition.onend = () => {
-      console.log("stopped recognizing")
-      if(this.finalTranscript.length == 0){
-        this.type("No response detected")
-
-      }
-      this.recognizing = false;
-
-      main.setStatusText("Status: Finished Transcribing")
-      // restart prediction after a pause
-      setTimeout(() => {
-        main.startPredicting()
-      }, 1000)
-    }
-
-    this.recognition.onresult = (event) => {
-      var interim_transcript = ''
-      if(typeof(event.results) == 'undefined'){
-        return;
-      }
-
-
-      for (var i = event.resultIndex; i < event.results.length; ++i) {
-        if (event.results[i].isFinal) {
-          this.finalTranscript += event.results[i][0].transcript;
-        } else {
-          interim_transcript += event.results[i][0].transcript;
-        }
-      }
-
-
-      this.interimType(interim_transcript)
-      this.type(this.finalTranscript)
-    }
-
-    setTimeout(()=>{
-      this.startListening();
-    },0)
-
-
-    setTimeout(()=>{
-      this.stopListening()
-    },this.cutOffTime)
+function liveWords(){
+  const out = []
+  for(let i = 1; i < slots.length; i++){
+    if(slots[i] !== null) out.push(i)
   }
-
-  startListening(){
-    if(this.recognizing){
-      this.recognition.stop()
-      return
-    }
-
-    console.log("listening")
-
-    main.pausePredicting()
-
-    try {
-      this.recognition.start()
-    } catch(err) {
-      console.log(err)
-      main.startPredicting()
-    }
-  }
-
-  stopListening(){
-    console.log("STOP LISTENING")
-    if(this.recognizing){
-      console.log("stop speech to text")
-      // onend restarts predicting
-      this.recognition.stop()
-      return
-    }
-  }
-
-  interimType(text){
-    this.loader.style.display = "none"
-    this.interimTextLine.innerText = text
-  }
-
-  type(text){
-    this.loader.style.display = "none"
-    this.textLine.innerText = text;
-  }
+  return out
 }
 
-var main = null;
+function refreshStatus(){
+  if(!modelReady) return setStatus('loading model', 'busy')
+  if(!camOn) return setStatus('camera off', '')
+  if(pausedForReply) return setStatus('listening for reply', 'busy')
+  if(predicting) return setStatus('predicting', 'on')
+  if(recording != -1) return setStatus('recording ' + slots[recording], 'on')
+  setStatus('ready', 'on')
+}
 
-window.addEventListener('load', () => {
+// ---------------------------------------------------------------- tabs
+function showTab(name){
+  document.querySelectorAll('nav button').forEach((b) => {
+    b.setAttribute('aria-selected', b.dataset.tab == name ? 'true' : 'false')
+  })
+  document.querySelectorAll('.panel').forEach((p) => p.classList.remove('on'))
+  const panel = $('#tab-' + name)
+  panel.classList.add('on')
 
-  var ua = navigator.userAgent.toLowerCase()
+  // the camera card lives in whichever tab has a slot for it
+  const slot = panel.querySelector('.slot')
+  if(slot) slot.appendChild($('#cameraCard'))
 
-  if(!(ua.indexOf("chrome") != -1 || ua.indexOf("firefox")!= -1)){
-    alert("Please visit in the latest Chrome or Firefox")
+  if(name == 'about') renderAbout()
+}
+
+document.querySelectorAll('nav button').forEach((b) => {
+  b.addEventListener('click', () => showTab(b.dataset.tab))
+})
+
+// ---------------------------------------------------------------- model
+function loadModel(){
+  setStatus('loading model', 'busy')
+  knn = new KNNImageClassifier(MAX_CLASSES, TOPK)
+  knn.load()
+  .then(() => {
+    modelReady = true
+    $('#modelFlag').textContent = 'ready'
+    $('#modelFlag').className = ''
+    refreshStatus()
+  })
+  .catch((err) => {
+    console.log(err)
+    $('#modelFlag').textContent = 'failed'
+    setStatus('model failed to load', 'err')
+    showErr('#camErr', 'The recognition model could not be downloaded. Check your internet connection and reload the page.')
+  })
+}
+
+// ---------------------------------------------------------------- camera
+const video = $('#vid')
+
+$('#btnCam').addEventListener('click', () => {
+  if(camOn) return stopCam()
+  showErr('#camErr', '')
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    return showErr('#camErr', 'This browser cannot access a camera. Use the latest Chrome on http://localhost.')
+  }
+  navigator.mediaDevices.getUserMedia({video: {width: 640, height: 480, facingMode: 'user'}, audio: false})
+  .then((stream) => {
+    video.srcObject = stream
+    return video.play()
+  })
+  .then(() => {
+    camOn = true
+    $('#btnCam').textContent = 'Stop camera'
+    $('#btnCam').classList.add('stop')
+    refreshStatus()
+  })
+  .catch((err) => {
+    console.log(err)
+    showErr('#camErr', 'Camera unavailable: ' + (err.message || err.name) +
+      '. Check that no other app is using it and that the browser has permission.')
+  })
+})
+
+function stopCam(){
+  camOn = false
+  stopRecording()
+  setPredicting(false)
+  if(video.srcObject) video.srcObject.getTracks().forEach((t) => t.stop())
+  video.srcObject = null
+  $('#btnCam').textContent = 'Start camera'
+  $('#btnCam').classList.remove('stop')
+  $('#fps').textContent = '-- fps'
+  refreshStatus()
+}
+
+// centre-crop the frame to a square so the classifier always sees the same geometry
+function grabFrame(){
+  const vw = video.videoWidth, vh = video.videoHeight
+  const s = Math.min(vw, vh)
+  cropCtx.drawImage(video, (vw - s) / 2, (vh - s) / 2, s, s, 0, 0, IMAGE_SIZE, IMAGE_SIZE)
+  return dl.fromPixels(cropCanvas)
+}
+
+// ---------------------------------------------------------------- main loop
+function loop(){
+  requestAnimationFrame(loop)
+
+  const now = performance.now()
+  if(now - fpsT > 1000){
+    if(camOn) $('#fps').textContent = processed + ' fps'
+    processed = 0
+    fpsT = now
+  }
+
+  if(!camOn || !modelReady || video.readyState < 2) return
+
+  if(recording != -1){
+    const image = grabFrame()
+    knn.addImage(image, recording)
+    image.dispose()
+    processed++
+    updateCount(recording)
     return
   }
 
+  if(predicting && !pausedForReply){
+    if(!predictBusy && now - lastPredictAt >= PREDICT_INTERVAL_MS){
+      lastPredictAt = now
+      predictOnce()
+    }
+    checkSentenceEnd(now)
+  }
+}
 
-  main = new Main()
+function predictOnce(){
+  const total = counts().reduce((a, b) => a + b, 0)
+  if(total == 0) return
 
-});
+  predictBusy = true
+  const image = grabFrame()
+  knn.predictClass(image)
+  .then((res) => {
+    processed++
+    if(predicting && !pausedForReply) onPrediction(res.classIndex, res.confidences[res.classIndex] || 0)
+  })
+  .catch((err) => console.log(err))
+  .then(() => {
+    image.dispose()
+    predictBusy = false
+  })
+}
 
+// ---------------------------------------------------------------- smoothing
+function onPrediction(cls, conf){
+  const name = cls >= 0 && slots[cls] !== null ? slots[cls] : '?'
+  $('#livePred').textContent = name + '  ' + Math.round(conf * 100) + '%'
+  $('#liveBar').style.width = (conf * 100) + '%'
+
+  if(conf < CONF_THRESHOLD || cls < 0 || slots[cls] === null){
+    candidate = -1
+    candidateCount = 0
+    return
+  }
+
+  if(cls != IDLE) lastSignAt = performance.now()
+
+  if(cls == candidate){
+    candidateCount++
+  } else {
+    candidate = cls
+    candidateCount = 1
+  }
+
+  if(candidateCount != STABLE_FRAMES) return
+
+  if(cls == IDLE){
+    // returning to idle lets the same word be signed again
+    lastAccepted = IDLE
+    return
+  }
+
+  if(cls == lastAccepted) return
+  lastAccepted = cls
+
+  if(chipsStale){
+    buffer = []
+    chipsStale = false
+  }
+  buffer.push(slots[cls])
+  renderChips()
+}
+
+function checkSentenceEnd(now){
+  if(buffer.length == 0 || chipsStale) return
+  if(now - lastSignAt < SENTENCE_GAP_MS) return
+  finishSentence()
+}
+
+function finishSentence(){
+  let sentence = buffer.join(' ')
+  sentence = sentence.charAt(0).toUpperCase() + sentence.slice(1)
+  chipsStale = true
+  lastAccepted = -1
+
+  const el = $('#sentence')
+  el.classList.remove('empty')
+  el.textContent = sentence
+
+  if($('#autoSpeak').checked){
+    speak(sentence, $('#lang').value, () => {
+      if($('#listenReply').checked) listenForReply()
+    })
+  } else if($('#listenReply').checked){
+    listenForReply()
+  }
+}
+
+function renderChips(){
+  const box = $('#chips')
+  box.innerHTML = ''
+  buffer.forEach((w) => {
+    const span = document.createElement('span')
+    span.className = 'chip'
+    span.textContent = w.toUpperCase()
+    box.appendChild(span)
+  })
+}
+
+function setPredicting(on){
+  predicting = on
+  candidate = -1
+  candidateCount = 0
+  const b = $('#btnPredict')
+  b.textContent = on ? 'Stop predicting' : 'Start predicting'
+  b.classList.toggle('stop', on)
+  if(!on){
+    $('#livePred').textContent = 'waiting for signs'
+    $('#liveBar').style.width = '0'
+  }
+  refreshStatus()
+}
+
+function readyToPredict(){
+  if(!modelReady) return 'The model is still loading. Give it a few seconds.'
+  if(!camOn) return 'Start the camera first.'
+  const c = counts()
+  if(c[IDLE] == 0) return 'Record some IDLE examples first (hands down, not signing). Without them every frame looks like a word.'
+  if(!liveWords().some((i) => c[i] > 0)) return 'Record examples for at least one word first.'
+  return null
+}
+
+$('#btnPredict').addEventListener('click', () => {
+  if(predicting) return setPredicting(false)
+  const problem = readyToPredict()
+  showErr('#signErr', problem)
+  if(problem) return
+  stopRecording()
+  setPredicting(true)
+})
+
+$('#btnGoSign').addEventListener('click', () => {
+  const problem = readyToPredict()
+  showErr('#trainErr', problem)
+  if(problem) return
+  showErr('#signErr', '')
+  showTab('sign')
+  stopRecording()
+  setPredicting(true)
+})
+
+$('#btnClear').addEventListener('click', () => {
+  buffer = []
+  chipsStale = false
+  lastAccepted = -1
+  renderChips()
+  const el = $('#sentence')
+  el.classList.add('empty')
+  el.textContent = 'Sign to begin. Return to idle for a moment to end a sentence.'
+  $('#replyBox').hidden = true
+})
+
+$('#btnSpeak').addEventListener('click', () => {
+  if($('#sentence').classList.contains('empty')) return
+  speak($('#sentence').textContent, $('#lang').value)
+})
+
+// ---------------------------------------------------------------- training UI
+function renderWords(){
+  const list = $('#wordList')
+  list.innerHTML = ''
+  const c = counts()
+
+  slots.forEach((word, i) => {
+    if(word === null) return
+
+    const row = document.createElement('div')
+    row.className = 'word'
+
+    const name = document.createElement('span')
+    name.className = 'name'
+    name.textContent = word.toUpperCase()
+    if(i == IDLE){
+      const small = document.createElement('small')
+      small.textContent = 'hands down / not signing'
+      name.appendChild(small)
+    }
+    row.appendChild(name)
+
+    const count = document.createElement('span')
+    count.className = 'count'
+    count.id = 'count-' + i
+    row.appendChild(count)
+
+    const rec = document.createElement('button')
+    rec.className = 'act rec'
+    rec.textContent = 'Record'
+    rec.title = 'Hold while signing'
+    const start = (e) => {
+      e.preventDefault()
+      startRecording(i, rec)
+    }
+    rec.addEventListener('pointerdown', start)
+    rec.addEventListener('pointerup', stopRecording)
+    rec.addEventListener('pointerleave', stopRecording)
+    rec.addEventListener('pointercancel', stopRecording)
+    rec.addEventListener('contextmenu', (e) => e.preventDefault())
+    rec.addEventListener('keydown', (e) => {
+      if((e.key == ' ' || e.key == 'Enter') && !e.repeat) start(e)
+    })
+    rec.addEventListener('keyup', (e) => {
+      if(e.key == ' ' || e.key == 'Enter') stopRecording()
+    })
+    row.appendChild(rec)
+
+    const clear = document.createElement('button')
+    clear.className = 'ghost'
+    clear.textContent = 'Clear'
+    clear.addEventListener('click', () => {
+      if(knn) knn.clearClass(i)
+      updateCount(i, counts())
+    })
+    row.appendChild(clear)
+
+    if(i != IDLE){
+      const del = document.createElement('button')
+      del.className = 'ghost'
+      del.textContent = '\u2715'
+      del.title = 'Remove word'
+      del.setAttribute('aria-label', 'Remove ' + word)
+      del.addEventListener('click', () => {
+        if(knn) knn.clearClass(i)
+        slots[i] = null
+        renderWords()
+      })
+      row.appendChild(del)
+    }
+
+    list.appendChild(row)
+    updateCount(i, c)
+  })
+}
+
+let lastCountUpdate = 0
+function updateCount(i, c){
+  // recording runs every frame; don't touch the DOM more than ~10x/sec
+  const now = performance.now()
+  if(!c && now - lastCountUpdate < 100) return
+  lastCountUpdate = now
+
+  const el = document.getElementById('count-' + i)
+  if(!el) return
+  const n = (c || counts())[i]
+  el.textContent = n
+  el.className = 'count' + (n >= 30 ? ' ok' : '')
+}
+
+function startRecording(i, btn){
+  if(!modelReady) return showErr('#trainErr', 'The model is still loading. Give it a few seconds.')
+  if(!camOn) return showErr('#trainErr', 'Start the camera first.')
+  showErr('#trainErr', '')
+  if(predicting) setPredicting(false)
+  recording = i
+  btn.classList.add('held')
+  $('#recWord').textContent = slots[i].toUpperCase()
+  $('#recFlag').hidden = false
+  refreshStatus()
+}
+
+function stopRecording(){
+  if(recording == -1) return
+  const i = recording
+  recording = -1
+  document.querySelectorAll('button.rec.held').forEach((b) => b.classList.remove('held'))
+  $('#recFlag').hidden = true
+  updateCount(i, counts())
+  refreshStatus()
+}
+window.addEventListener('blur', stopRecording)
+
+$('#addWord').addEventListener('submit', (e) => {
+  e.preventDefault()
+  const input = $('#newWord')
+  const word = input.value.trim().replace(/\s+/g, ' ')
+  if(!word) return
+  const taken = slots.some((w) => w !== null && w.toLowerCase() == word.toLowerCase())
+  if(taken) return showErr('#trainErr', '"' + word + '" is already in the list.')
+  if(slots.length >= MAX_CLASSES) return showErr('#trainErr', 'You can add up to ' + (MAX_CLASSES - 1) + ' words.')
+  showErr('#trainErr', '')
+  slots.push(word)
+  input.value = ''
+  renderWords()
+})
+
+// ---------------------------------------------------------------- text to speech
+let voices = []
+let currentUtterance = null   // Chrome drops onend if the utterance gets garbage collected
+
+function loadVoices(){
+  if(!window.speechSynthesis) return
+  voices = window.speechSynthesis.getVoices()
+}
+if(window.speechSynthesis){
+  loadVoices()
+  window.speechSynthesis.onvoiceschanged = loadVoices
+}
+
+function pickVoice(code){
+  const norm = (l) => (l || '').replace('_', '-').toLowerCase()
+  const want = code.toLowerCase()
+  const base = want.split('-')[0]
+  return voices.find((v) => norm(v.lang) == want) ||
+    voices.find((v) => norm(v.lang).split('-')[0] == base && v.name.indexOf('Google') != -1) ||
+    voices.find((v) => norm(v.lang).split('-')[0] == base) ||
+    null
+}
+
+function speak(text, lang, onend){
+  if(!window.speechSynthesis || !text){
+    if(onend) onend()
+    return
+  }
+  const code = LANG_CODES[lang] || 'en-IN'
+  const u = new SpeechSynthesisUtterance(text)
+  u.lang = code
+  const voice = pickVoice(code)
+  if(voice) u.voice = voice
+  u.rate = 0.95
+  let done = false
+  const finish = () => {
+    if(done) return
+    done = true
+    if(onend) onend()
+  }
+  u.onend = finish
+  u.onerror = (e) => {
+    console.log('speech error', e.error)
+    finish()
+  }
+  currentUtterance = u
+  window.speechSynthesis.cancel()
+  window.speechSynthesis.speak(u)
+}
+
+function voiceWarning(lang, box){
+  if(!voices.length) return
+  if(!pickVoice(LANG_CODES[lang])){
+    showErr(box, 'No ' + LANG_NAMES[lang] + ' voice is installed in this browser, so the default voice will be used. ' +
+      'Add one in Windows Settings > Time & language > Speech, then restart Chrome.')
+  } else {
+    showErr(box, '')
+  }
+}
+$('#lang').addEventListener('change', () => voiceWarning($('#lang').value, '#signErr'))
+
+// ---------------------------------------------------------------- speech recognition
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+
+// after a signed sentence: listen for the spoken answer (e.g. an Echo nearby)
+function listenForReply(){
+  const box = $('#replyBox')
+  const out = $('#reply')
+  box.hidden = false
+  out.className = 'out empty'
+
+  if(!Recognition){
+    out.textContent = 'Speech recognition is not supported in this browser (use Chrome).'
+    return
+  }
+
+  out.textContent = 'listening\u2026'
+  pausedForReply = true
+  refreshStatus()
+
+  const r = new Recognition()
+  r.lang = LANG_CODES[$('#lang').value]
+  r.continuous = true
+  r.interimResults = true
+  let finalText = ''
+  let cutoff = null
+
+  r.onresult = (e) => {
+    let interim = ''
+    for(let i = e.resultIndex; i < e.results.length; i++){
+      if(e.results[i].isFinal) finalText += e.results[i][0].transcript
+      else interim += e.results[i][0].transcript
+    }
+    out.className = 'out'
+    out.textContent = finalText + interim
+  }
+  r.onerror = (e) => console.log('reply recognition error', e.error)
+  r.onend = () => {
+    clearTimeout(cutoff)
+    if(!finalText){
+      out.className = 'out empty'
+      out.textContent = 'No reply heard.'
+    }
+    // short pause so the reply isn't mistaken for the next query
+    setTimeout(() => {
+      pausedForReply = false
+      lastSignAt = performance.now()
+      refreshStatus()
+    }, 1000)
+  }
+
+  cutoff = setTimeout(() => r.stop(), REPLY_CUTOFF_MS)
+  try {
+    r.start()
+  } catch(err) {
+    console.log(err)
+    clearTimeout(cutoff)
+    pausedForReply = false
+    refreshStatus()
+  }
+}
+
+// SPEECH -> TEXT tab
+let mic = null
+let micWanted = false
+let micFinal = ''
+
+$('#btnMic').addEventListener('click', () => {
+  if(!Recognition){
+    return showErr('#speechErr', 'This browser has no speech recognition. Use Chrome, or type instead.')
+  }
+  if(micWanted) return stopMic()
+  showErr('#speechErr', '')
+  micWanted = true
+  micFinal = ''
+  renderTranscript('')
+  $('#btnMic').textContent = 'Stop listening'
+  $('#btnMic').classList.add('stop')
+  startMic()
+})
+
+function startMic(){
+  mic = new Recognition()
+  mic.lang = LANG_CODES[$('#lang2').value]
+  mic.continuous = true
+  mic.interimResults = true
+
+  mic.onresult = (e) => {
+    let interim = ''
+    for(let i = e.resultIndex; i < e.results.length; i++){
+      if(e.results[i].isFinal) micFinal += e.results[i][0].transcript + ' '
+      else interim += e.results[i][0].transcript
+    }
+    renderTranscript(interim)
+  }
+  mic.onerror = (e) => {
+    console.log('recognition error', e.error)
+    if(e.error == 'not-allowed' || e.error == 'service-not-allowed'){
+      showErr('#speechErr', 'Microphone access was blocked. Allow it in the address bar and try again.')
+      stopMic()
+    } else if(e.error == 'network'){
+      showErr('#speechErr', 'Speech recognition needs an internet connection in Chrome.')
+      stopMic()
+    } else if(e.error == 'language-not-supported'){
+      showErr('#speechErr', LANG_NAMES[$('#lang2').value] + ' recognition is not available in this browser.')
+      stopMic()
+    }
+  }
+  // Chrome ends continuous sessions after a silence; keep going until the user stops
+  mic.onend = () => {
+    if(micWanted){
+      try { mic.start() } catch(err) { stopMic() }
+    }
+  }
+  try {
+    mic.start()
+  } catch(err) {
+    console.log(err)
+    stopMic()
+  }
+}
+
+function stopMic(){
+  micWanted = false
+  if(mic){
+    mic.onend = null
+    try { mic.stop() } catch(err) {}
+  }
+  mic = null
+  $('#btnMic').textContent = 'Start listening'
+  $('#btnMic').classList.remove('stop')
+  renderTranscript('')
+}
+
+$('#lang2').addEventListener('change', () => {
+  voiceWarning($('#lang2').value, '#speechErr')
+  if(micWanted){
+    stopMic()
+    $('#btnMic').click()
+  }
+})
+
+function renderTranscript(interim){
+  const el = $('#transcript')
+  el.innerHTML = ''
+  if(!micFinal && !interim){
+    el.className = 'out big empty'
+    el.textContent = micWanted ? 'listening\u2026' : 'Press start and speak. The words appear here for a deaf or hard-of-hearing reader.'
+  } else {
+    el.className = 'out big'
+    el.appendChild(document.createTextNode(micFinal))
+    const span = document.createElement('span')
+    span.className = 'interim'
+    span.textContent = interim
+    el.appendChild(span)
+  }
+
+  // trained words that appear in what was said
+  const said = (' ' + micFinal + ' ' + interim + ' ').toLowerCase()
+  const box = $('#chips2')
+  box.innerHTML = ''
+  liveWords().forEach((i) => {
+    if(said.indexOf(slots[i].toLowerCase()) != -1){
+      const chip = document.createElement('span')
+      chip.className = 'chip'
+      chip.textContent = slots[i].toUpperCase()
+      box.appendChild(chip)
+    }
+  })
+}
+
+$('#btnSay').addEventListener('click', () => speak($('#sayText').value.trim(), $('#lang2').value))
+$('#sayText').addEventListener('keydown', (e) => {
+  if(e.key == 'Enter') speak($('#sayText').value.trim(), $('#lang2').value)
+})
+
+// ---------------------------------------------------------------- about
+function renderAbout(){
+  const c = counts()
+  const box = $('#vocabList')
+  box.innerHTML = ''
+  let total = 0
+  slots.forEach((w, i) => {
+    if(w === null) return
+    total += c[i]
+    const span = document.createElement('span')
+    span.textContent = w.toUpperCase() + ' \u00b7 ' + c[i]
+    box.appendChild(span)
+  })
+  const voiceInfo = Object.keys(LANG_CODES).map((l) => l + (pickVoice(LANG_CODES[l]) ? ' \u2713' : ' \u2717')).join('  ')
+  $('#healthOut').textContent =
+    liveWords().length + ' words \u00b7 ' + total + ' examples \u00b7 model ' +
+    (modelReady ? 'loaded' : 'loading') + ' \u00b7 voices: ' + voiceInfo +
+    ' \u00b7 speech recognition ' + (Recognition ? 'available' : 'unavailable')
+}
+
+// ---------------------------------------------------------------- start
+function init(){
+  showTab('train')
+  renderWords()
+  loadModel()
+  requestAnimationFrame(loop)
+}
+
+if(document.readyState == 'loading'){
+  document.addEventListener('DOMContentLoaded', init)
+} else {
+  init()
+}
